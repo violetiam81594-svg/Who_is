@@ -1,0 +1,20 @@
+<script src="https://gist.github.com/violetiam81594-svg/d3cac74afda98286c82933eb7d7c9a0b.js"></script># Install deps
+pip install requests
+
+# Scan YOUR codebase for hidden malicious patterns
+python blame_game.py scan /path/to/your/project --output findings.json
+
+# Scan a SUSPECTED malicious website
+python blame_game.py scan-remote https://suspicious-site.com --output remote_findings.json
+
+# See what deceptive patterns the system knows about
+python blame_game.py list-patterns
+
+# Log device access (tracks IP, location, fingerprint)
+python blame_game.py attest-device --ip 192.168.1.100 --ua "Mozilla/5.0..." --consent
+
+# Record every file change immutably
+python blame_game.py log-change --file "app.js" --type modified --changed-by "john.doe" --reason "bug fix"
+
+# Generate full accountability report
+python blame_game.py report
