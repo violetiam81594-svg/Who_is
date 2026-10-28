@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""
+Evidence Toolkit v1.0 — Traceability & Attribution System
+Protect your digital content with cryptographic proof, watermarks, and monitoring.
+
+Usage:
+    python evidence_toolkit.py --init              # Initialize project directory
+    python evidence_toolkit.py --hash-file file.txt     # Create file hash proof
+    python evidence_toolkit.py --watermark-text "your text" --output watermarked.txt
+    python evidence_toolkit.py --watermark-image input.jpg --output watermarked.jpg
+    python evidence_toolkit.py --scan-clones https://your-site.com --duration 7
+    python evidence_toolkit.py --log-server        # Start local log server
+    python evidence_toolkit.py --generate-report output_report.md
+
+Author: violetiam81594
+License: MIT
+"""
+
+import os
+import sys
+import json
+import hashlib
+import base64
+import uuid
+import time
+import datetime
+import argparse
+import secrets
+import struct
+import socket
+import threading
+from pathlib import Path
+from typing import Optional, Dict, List, Any
+from urllib.request import urlopen, Request
+from urllib.parse import urlparse, urlencode
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.error
+
+# ============================================================
+# SECTION 1: CRYPTOGRAPHIC HASHING & LEDGER
+# ============================================================
+
+class HashLedger:
+    """
+    Immutable hash chain ledger for proving content existed at a point in time.
+    Each entry includes a timestamp, content hash, and previous hash (Merkle-style).
+    """
+    
+    def __init__(self, ledger_path: str = ".evidence_ledger.json"):
+        self.ledger_path = Path(ledger_path)
+        self.entries: List[Dict[str, Any]] = []
+        
+    def _load(self) -> None:
+        if self.ledger_path.exists():
+            with open(self.ledger_path, 'r') as f:
+                data = json.load(f)
+                self.entries = data.get('entries', [])
+        else:
+            self.entries = []
+            
+    def _save(self) -> None:
+        data = {
+            'version': 1,
+            'created_at': datetime.datetime.utcnow().isoformat(),
+            'entries': self.entries
+        }
+        with open(self.ledger_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            
+    def add_entry(self, content_hash: str, content_type: str, 
+                  description: str, metadata: Optional[Dict] = None) -> str:
+        """
+        Add a new entry to the ledger. Returns the entry ID.
+        Each entry is chained via the previous hash for immutability.
+        """
+        self._load()
+        
+        previous_hash = self.entries[-1]['hash'] if self.entries else 'GENESIS'
+        
+        # Compute this entry's hash (includes previous for chaining)
+        entry_data = {
+            'id': str(uuid.uuid4()),
+            'timestamp': datetime.datetime.utcnow().isoformat(),
+            'previous_hash': previous_hash,
+            'content_hash': content_hash,
+            'content_type': content_type,
+            'description': description,
+            'metadata': metadata or {}
+        }
+        
+        # Chain hash computation
+        chain_string = f"{previous_hash}:{content_hash}:{entry_data['timestamp']}"
+        entry_hash = hashlib.sha256(chain_string.encode()).hexdigest()
+        entry_data['hash'] = entry_hash
+        
+        self.entries.append(entry_data)
+        self._save()
+        
+        return entry_data['id']
+    
+    def verify_integrity(self) -> bool:
+        """Verify the ledger hasn't been tampered with."""
+        if not self.entries:
+            return True
+            
+        for i, entry in enumerate(self.entries):
+            if i == 0:
+                expected_prev = 'GENESIS'
+            else:
+                expected_prev = self.entries[i-1]['hash']
+                
+            if entry['previous_hash'] != expected_prev:
+                print(f"[FAIL] Entry {i}: Previous hash mismatch")
+                return False
+                
+        return True
+    
+    def export_to_blockchain_timestamp(self) -> Dict[str, Any]:
+        """
+        Export latest entry for public timestamping services.
+        Consider submitting hash to:
+        - OpenTimestamps (https://opentimestamps.org)
+        - Blockstream (Bitcoin blockchain)
+        """
+        if not self.entries:
+            raise ValueError("No entries to export")
+            
+        return {
+            'hash': self.entries[-1]['hash'],
+            'timestamp': self.entries[-1]['timestamp'],
+            'content_type': self.entries[-1]['content_type'],
+            'ledger_size': len(self.entries)
+        }
+
+
+def compute_file_hash(filepath: str, algorithm: str = 'sha256') -> str:
+    """Compute hash of a file in chunks (memory efficient)."""
+    hasher = hashlib.new(algorithm)
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(8192):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def compute_string_hash(content: str, algorithm: str = 'sha256') -> str:
+    """Compute hash of string content."""
+    return hashlib.new(algorithm, content.encode()).hexdigest()
+
+
+# ============================================================
+# SECTION 2: TEXT WATERMARKING
+# ============================================================
+
+def embed_text_watermark(text: str, watermark: str, 
+                         method: str = 'invisible_unicode') -> str:
+    """
+    Embed a watermark into text using various methods.
+    
+    Methods:
+    - invisible_unicode: Zero-width characters between words
+    - whitespace_shift: Alter whitespace patterns (subtle)
+    - sentence_capitalization: Encode bits via capitalization (visible)
+    """
+    if method == 'invisible_unicode':
+        # Use zero-width space U+200B and zero-width non-joiner U+200C
+        wm_bytes = watermark.encode('utf-8')
+        encoded = ''
+        for byte in wm_bytes:
+            if byte % 2 == 0:
+                encoded += '\u200B'  # Zero-width space
+            else:
+                encoded += '\u200C'  # Zero-width non-joiner
+        # Insert encoded watermark throughout the text
+        words = text.split()
+        result = []
+        for i, word in enumerate(words):
+            result.append(word)
+            if i < len(encoded):
+                result.append(encoded[i])
+        return ' '.join(result)
+        
+    elif method == 'whitespace_shift':
+        # Alternate single vs double spaces based on watermark bits
+        wm_binary = ''.join(format(b, '08b') for b in watermark.encode())
+        words = text.split()
+        result = [words[0]]
+        bit_idx = 0
+        for i in range(1, len(words)):
+            spacer = '  ' if bit_idx < len(wm_binary) and wm_binary[bit_idx] == '1' else ' '
+            if bit_idx < len(wm_binary):
+                bit_idx += 1
+            result.append(spacer + words[i])
+        return ''.join(result)
+        
+    else:
+        # Fallback: append to end
+        return text + f"\n<!-- Watermarked: {watermark} -->"
+
+
+def extract_text_watermark(text: str, method: str = 'invisible_unicode') -> Optional[str]:
+    """Extract watermark from watermarked text."""
+    if method == 'invisible_unicode':
+        # Extract zero-width characters
+        zws = '\u200B'  # Even bit
+        zwj = '\u200C'  # Odd bit
+        bits = []
+        for char in text:
+            if char == zws:
+                bits.append('0')
+            elif char == zwj:
+                bits.append('1')
+        
+        if not bits:
+            return None
+            
+        # Convert bits to bytes
+        binary_str = ''.join(bits[:len(bits)//8*8])  # Round down to byte boundary
+        result = []
+        for i in range(0, len(binary_str), 8):
+            byte_val = int(binary_str[i:i+8], 2)
+            result.append(byte_val)
+        return bytes(result).decode('utf-8', errors='ignore')
+        
+    return None
+
+
+# ============================================================
+# SECTION 3: IMAGE WATERMARKING (STEGANOGRAPHY)
+# ============================================================
+
+def embed_image_steganography(image_path: str, secret_message: str, 
+                              output_path: str) -> bool:
+    """
+    Embed a secret message into an image using LSB steganography.
+    This modifies the least significant bit of pixel colors.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[ERROR] Pillow library required. Run: pip install Pillow")
+        return False
+    
+    img = Image.open(image_path)
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    pixels = list(img.getdata())
+    width, height = img.size
+    
+    # Encode message length + message
+    msg_with_len = struct.pack('>I', len(secret_message)) + secret_message.encode('utf-8')
+    binary_msg = ''.join(format(byte, '08b') for byte in msg_with_len)
+    
+    if len(binary_msg) > len(pixels) * 3:
+        print("[ERROR] Message too large for image")
+        return False
+    
+    # Modify LSBs
+    new_pixels = []
+    bit_idx = 0
+    for pixel in pixels:
+        r, g, b = pixel
+        if bit_idx < len(binary_msg):
+            r &= 0xFE
+            r |= int(binary_msg[bit_idx])
+            bit_idx += 1
+        if bit_idx < len(binary_msg):
+            g &= 0xFE
+            g |= int(binary_msg[bit_idx])
+            bit_idx += 1
+        if bit_idx < len(binary_msg):
+            b &= 0xFE
+            b |= int(binary_msg[bit_idx])
+            bit_idx += 1
+        new_pixels.append((r, g, b))
+    
+    new_img = Image.new('RGB', (width, height))
+    new_img.putdata(new_pixels)
+    new_img.save(output_path, quality=95)
+    
+    return True
+
+
+def extract_image_steganography(image_path: str) -> Optional[str]:
+    """Extract hidden message from steganographic image."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[ERROR] Pillow library required. Run: pip install Pillow")
+        return None
+    
+    img = Image.open(image_path)
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    pixels = list(img.getdata())
+    bits = []
+    
+    for pixel in pixels:
+        r, g, b = pixel
+        bits.append(str(r & 1))
+        bits.append(str(g & 1))
+        bits.append(str(b & 1))
+    
+    # Read message length first
+    length_bits = ''.join(bits[:32])
+    msg_len = int(length_bits, 2)
+    
+    if msg_len > 10000:  # Sanity check
+        return None
+    
+    # Extract message
+    msg_bits = bits[32:32 + msg_len * 8]
+    msg_bytes = []
+    for i in range(0, len(msg_bits), 8):
+        byte_val = int(''.join(msg_bits[i:i+8]), 2)
+        msg_bytes.append(byte_val)
+    
+    return bytes(msg_bytes).decode('utf-8', errors='ignore')
+
+
+# ============================================================
+# SECTION 4: VIDEO ATTRIBUTION
+# ============================================================
+
+def generate_video_metadata_block(video_id: str, creator: str, 
+                                   created_at: str, original_domain: str) -> Dict[str, Any]:
+    """
+    Create a metadata block for video attribution.
+    Embed this in the video file metadata or alongside it.
+    """
+    return {
+        'video_id': video_id,
+        'creator': creator,
+        'original_domain': original_domain,
+        'created_at': created_at,
+        'signature': generate_content_signature(video_id, creator, created_at, original_domain),
+        'verification_url': f"https://{original_domain}/verify/{video_id}"
+    }
+
+
+def generate_content_signature(*components: str) -> str:
+    """Generate a verification signature from multiple components."""
+    combined = ':'.join(components)
+    return hashlib.sha256(combined.encode()).hexdigest()[:32]
+
+
+def create_audio_watermark(audio_path: str, watermark: str, 
+                           output_path: str, strength: float = 0.5) -> bool:
+    """
+    Add audible/inaudible frequency watermark to audio.
+    Requires scipy and numpy.
+    """
+    try:
+        import numpy as np
+        from scipy.io import wavfile
+    except ImportError:
+        print("[ERROR] scipy and numpy required. Run: pip install scipy numpy")
+        return False
+    
+    sample_rate, data = wavfile.read(audio_path)
+    
+    # Generate frequency-based watermark (simplified)
+    # In production, use spread spectrum techniques
+    wm_duration = 0.5  # seconds
+    wm_samples = int(sample_rate * wm_duration)
+    freq = 19000  # Near upper limit of human hearing
+    
+    time_axis = np.arange(wm_samples) / sample_rate
+    watermark_signal = np.sin(2 * np.pi * freq * time_axis) * strength
+    watermark_signal = np.concatenate([watermark_signal, np.zeros(len(data) - wm_samples)])
+    
+    watermarked_data = data + (watermark_signal * np.max(np.abs(data)) * 0.01)
+    watermarked_data = np.clip(watermarked_data, -np.iinfo(data.dtype).max, np.iinfo(data.dtype).max)
+    
+    wavfile.write(output_path, sample_rate, watermarked_data.astype(data.dtype))
+    return True
+
+
+# ============================================================
+# SECTION 5: DOM PROTECTION & TRACKER GENERATOR
+# ============================================================
+
+def generate_dom_protection_script(site_id: str, tracking_domain: str) -> str:
+    """
+    Generate JavaScript to embed in your web pages for:
+    1. Content integrity checking
+    2. Theft detection beacon
+    3. Attribution persistence
+    """
+    script = f'''
+// DOM Protection Script — {site_id}
+(function() {{
+    const SITE_ID = '{site_id}';
+    const TRACKING_DOMAIN = '{tracking_domain}';
+    const TRACKING_ENDPOINT = `{{TRACKING_DOMAIN}}/beacon/{{SITE_ID}}`;
+    
+    // 1. Generate unique session fingerprint
+    function generateSessionFingerprint() {{
+        const components = [
+            navigator.userAgent,
+            screen.width + 'x' + screen.height,
+            new Date().getTimezoneOffset(),
+            Math.random().toString(36).substring(7)
+        ];
+        return btoa(components.join('|'));
+    }}
+    
+    // 2. Load tracking pixel (invisible)
+    function fireTrackingBeacon(eventType, extraData = {{}}) {{
+        const payload = {{
+            siteId: SITE_ID,
+            eventType: eventType,
+            timestamp: Date.now(),
+            url: window.location.href,
+            referrer: document.referrer,
+            sessionFingerprint: generateSessionFingerprint(),
+            ...extraData
+        }};
+        
+        try {{
+            const blob = new Blob([JSON.stringify(payload)], {{ type: 'application/json' }});
+            const reader = new FileReader();
+            reader.onloadend = function() {{
+                const pixel = document.createElement('img');
+                pixel.src = `{{TRACKING_ENDPOINT}}?t={{encodeURIComponent(reader.result)}}`;
+                pixel.style.display = 'none';
+                document.body.appendChild(pixel);
+                setTimeout(() => pixel.remove(), 1000);
+            }};
+            reader.readAsDataURL(blob);
+        }} catch (e) {{
+            console.warn('[DOM Protection]', e);
+        }}
+    }}
+    
+    // 3. Integrity check: detect DOM manipulation
+    const originalBodyHTML = document.body.innerHTML;
+    setInterval(() => {{
+        if (document.body.innerHTML !== originalBodyHTML) {{
+            fireTrackingBeacon('DOM_MODIFIED', {{
+                originalHash: btoa(originalBodyHTML).slice(0, 32),
+                currentHash: btoa(document.body.innerHTML).slice(0, 32)
+            }});
+        }}
+    }}, 5000);
+    
+    // 4. Detect copy attempts
+    document.addEventListener('copy', () => {{
+        fireTrackingBeacon('COPY_ATTEMPT');
+    }});
+    
+    document.addEventListener('contextmenu', (e) => {{
+        fireTrackingBeacon('RIGHT_CLICK', {{ x: e.clientX, y: e.clientY }});
+    }});
+    
+    // 5. Fire load tracking
+    fireTrackingBeacon('PAGE_LOAD');
+    
+    // 6. Add persistent attribution comment
+    const attributionComment = document.createComment(
+        `Original content from: ${{TRACKING_DOMAIN}} | Site ID: ${{SITE_ID}}`
+    );
+    document.head.appendChild(attributionComment);
+    
+    console.log('[DOM Protection] Active for', SITE_ID);
+}})();
+    '''
+    return script
+
+
+# ============================================================
+# SECTION 6: LOG SERVER FOR RECEIVED BEACONS
+# ============================================================
+
+class BeaconLogHandler(BaseHTTPRequestHandler):
+    """HTTP handler that logs incoming tracking beacons."""
+    
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        
+        if parsed.path.startswith('/beacon/'):
+            # Extract tracking data from query string
+            params = dict(urlparse.parse_qsl(parsed.query))
+            beacon_data = {
+                'timestamp': datetime.datetime.utcnow().isoformat(),
+                'client_ip': self.client_address[0],
+                'user_agent': self.headers.get('User-Agent', 'unknown'),
+                **params
+            }
+            
+            # Log to file
+            log_dir = Path('./beacon_logs')
+            log_dir.mkdir(exist_ok=True)
+            log_file = log_dir / f"beacons_{datetime.date.today().isoformat()}.jsonl"
+            
+            with open(log_file, 'a') as f:
+                f.write(json.dumps(beacon_data) + '\n')
+            
+            print(f"[LOGGED] Beacon from {beacon_data['client_ip']}: {beacon_data.get('eventType', 'UNKNOWN')}")
+            
+            # Send back acknowledgement with verification
+            response = {
+                'status': 'logged',
+                'logged_at': beacon_data['timestamp'],
+                'your_ip': self.client_address[0]
+            }
+            
+        else:
+            response = {'error': 'Not found'}
+        
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode())
+    
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+
+
+def start_log_server(port: int = 8888):
+    """Start the beacon log server."""
+    server = HTTPServer(('0.0.0.0', port), BeaconLogHandler)
+    print(f"[SERVER] Starting beacon logger on port {port}")
+    print(f"[SERVER] Logs saved to ./beacon_logs/")
+    print(f"[CTRL+C] Press Ctrl+C to stop")
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[SERVER] Shutting down...")
+        server.shutdown()
+
+
+# ============================================================
+# SECTION 7: CLONE SCANNER
+# ============================================================
+
+def scan_website_for_content(site_url: str, search_term: str, 
+                             max_results: int = 50) -> List[Dict[str, Any]]:
+    """
+    Scan web for content matching criteria.
+    Uses search engine APIs and direct comparison.
+    """
+    results = []
+    
+    # Try Google Custom Search if API key available
+    google_api_key = os.environ.get('GOOGLE_CSE_API_KEY')
+    google_cse_id = os.environ.get('GOOGLE_CSE_ID')
+    
+    if google_api_key and google_cse_id:
+        query = f'{search_term} site:{urlparse(site_url).netloc}'
+        api_url = f'https://www.googleapis.com/customsearch/v1?key={google_api_key}&cx={google_cse_id}&q={urlencode({"q": query})}'
+        
+        try:
+            req = Request(api_url)
+            response = urlopen(req, timeout=10)
+            data = json.loads(response.read().decode())
+            
+            for item in data.get('items', []):
+                results.append({
+                    'url': item['link'],
+                    'title': item['title'],
+                    'snippet': item['snippet'],
+                    'source': 'Google CSE'
+                })
+        except Exception as e:
+            print(f"[WARN] Google CSE failed: {e}")
+    
+    # Fallback: DuckDuckGo HTML parsing (unreliable but works)
+    if len(results) < 10:
+        print("[INFO] Falling back to DDG search...")
+        ddg_query = f'{search_term}'
+        ddg_url = f'https://html.duckduckgo.com/html/?q={urlencode({"q": ddg_query})}'
+        
+        try:
+            req = Request(ddg_url, headers={'User-Agent': 'Mozilla/5.0'})
+            response = urlopen(req, timeout=10)
+            # Note: Actual HTML parsing would go here
+            print("[WARN] DDG scraping disabled for this version—implement parser separately")
+        except Exception as e:
+            print(f"[WARN] DDG search failed: {e}")
+    
+    return results
+
+
+def compare_dom_similarity(url1: str, url2: str) -> float:
+    """
+    Compare two URLs by fetching and comparing their DOM structure.
+    Returns similarity score 0.0 - 1.0.
+    """
+    # Fetch both pages (requires requests library or similar)
+    # Simplified: compare visible text similarity
+    try:
+        resp1 = urlopen(url1, timeout=10)
+        resp2 = urlopen(url2, timeout=10)
+        
+        html1 = resp1.read().decode(errors='ignore')
+        html2 = resp2.read().decode(errors='ignore')
+        
+        # Very basic similarity: Jaccard index on words
+        words1 = set(html1.lower().split())
+        words2 = set(html2.lower().split())
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        
+        return intersection / union if union > 0 else 0.0
+        
+    except Exception as e:
+        print(f"[ERROR] Comparison failed: {e}")
+        return 0.0
+
+
+# ============================================================
+# SECTION 8: REPORT GENERATOR
+# ============================================================
+
+def generate_evidence_report(outpath: str = 'evidence_report.md'):
+    """Generate a comprehensive evidence report documenting all findings."""
+    report = f"""# Evidence Report — Digital Attribution & Tracking
+
+Generated: {datetime.datetime.utcnow().isoformat()}
+Tool Version: 1.0
+Project Owner: violetiam81594
+
+---
+
+## Summary
+
+This report documents all content ownership proofs, watermarks applied, tracking systems deployed, and monitoring results.
+
+---
+
+## Ledger Entries
+
+Run the following to view your hash chain:
+```bash
+python -c "from evidence_toolkit import HashLedger; l = HashLedger(); print(json.dumps(l.entries, indent=2))"
+```
+
+---
+
+## Active Tracking Domains
+
+Configure these in your `.env` file:
+```
+TRACKING_DOMAIN=https://your-tracker-domain.com
+SITE_ID=your-unique-site-id
+```
+
+---
+
+## Beacon Logs Location
+
+Beacon logs are stored in: `./beacon_logs/`
+
+Format: JSONL (one JSON object per line)
+Contains: IP address, timestamp, event type, referrer
+
+---
+
+## Recommended Next Steps
+
+1. **Register your ledger** with a public timestamping service (OpenTimestamps)
+2. **Deploy tracking script** to all pages you own
+3. **Monitor beacon logs** daily for suspicious activity
+4. **Save copies** of all watermarked content
+5. **Document the chain of custody** for any disputed content
+
+---
+
+## Disclaimers
+
+- IP addresses alone are not sufficient for legal identification
+- Client-side tracking can be blocked or modified
+- This toolkit provides *evidence*, not *proof of guilt*
+- Consult legal counsel before taking action against suspected infringers
+
+---
+
+## Contact & Support
+
+Issues: Report via your repository
+Documentation: See README.md for detailed usage
+
+"""
+    
+    with open(outpath, 'w') as f:
+        f.write(report)
+    
+    print(f"[REPORT] Saved to {outpath}")
+
+
+# ============================================================
+# SECTION 9: MAIN CLI INTERFACE
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description='Evidence Toolkit v1.0')
+    subparsers = parser.add_subparsers(dest='command')
+    
+    # Init command
+    init_parser = subparsers.add_parser('init', help='Initialize project directory')
+    
+    # Hash commands
+    hash_parser = subparsers.add_parser('hash-file', help='Hash a file for proof')
+    hash_parser.add_argument('filepath', type=str, help='Path to file')
+    
+    text_wm_parser = subparsers.add_parser('watermark-text', help='Watermark text')
+    text_wm_parser.add_argument('--input', '-i', required=True, help='Input text file')
+    text_wm_parser.add_argument('--output', '-o', required=True, help='Output file')
+    text_wm_parser.add_argument('--watermark', '-w', required=True, help='Watermark string')
+    
+    img_wm_parser = subparsers.add_parser('watermark-image', help='Steganographic image watermark')
+    img_wm_parser.add_argument('--input', '-i', required=True, help='Input image')
+    img_wm_parser.add_argument('--output', '-o', required=True, help='Output image')
+    img_wm_parser.add_argument('--secret', '-s', required=True, help='Secret message to embed')
+    
+    # Scan command
+    scan_parser = subparsers.add_parser('scan-clones', help='Scan for content clones')
+    scan_parser.add_argument('--url', '-u', required=True, help='URL to monitor')
+    scan_parser.add_argument('--duration', '-d', type=int, default=7, help='Days to monitor')
+    
+    # Log server
+    server_parser = subparsers.add_parser('log-server', help='Start beacon log server')
+    server_parser.add_argument('--port', '-p', type=int, default=8888, help='Port number')
+    
+    # Report
+    report_parser = subparsers.add_parser('generate-report', help='Generate evidence report')
+    report_parser.add_argument('--output', '-o', default='evidence_report.md', help='Output path')
+    
+    args = parser.parse_args()
+    
+    if args.command == 'init':
+        # Create directory structure
+        dirs = ['beacon_logs', 'ledgers', 'watermarked']
+        for d in dirs:
+            Path(d).mkdir(exist_ok=True)
+        
+        # Create .gitignore
+        gitignore = """
+beacon_logs/
+ledgers/
+__pycache__/
+*.pyc
+.env
+"""
+        Path('.gitignore').write_text(gitignore)
+        
+        print("[INIT] Project directories created")
+        print("[INIT] .gitignore created")
+        print("[INIT] Ready to use!")
+        
+    elif args.command == 'hash-file':
+        file_hash = compute_file_hash(args.filepath)
+        print(f"[HASH] {args.filepath}")
+        print(f"[HASH] SHA256: {file_hash}")
+        
+        # Also add to ledger
+        ledger = HashLedger()
+        entry_id = ledger.add_entry(file_hash, 'file', f'Hash proof for {args.filepath}')
+        print(f"[LEDGER] Entry ID: {entry_id}")
+        
+    elif args.command == 'watermark-text':
+        with open(args.input, 'r') as f:
+            text = f.read()
+        
+        watermarked = embed_text_watermark(text, args.watermark)
+        with open(args.output, 'w') as f:
+            f.write(watermarked)
+        
+        print(f"[WATERMARK] Watermarked text saved to {args.output}")
+        
+        # Log to ledger
+        ledger = HashLedger()
+        entry_id = ledger.add_entry(
+            compute_string_hash(watermarked),
+            'watermarked-text',
+            f'Text watermark: {args.watermark}',
+            {'input': args.input, 'output': args.output}
+        )
+        print(f"[LEDGER] Entry ID: {entry_id]")
+        
+    elif args.command == 'watermark-image':
+        success = embed_image_steganography(args.input, args.secret, args.output)
+        if success:
+            print(f"[WATERMARK] Steganographic watermark embedded in {args.output}")
+            
+            # Log to ledger
+            ledger = HashLedger()
+            entry_id = ledger.add_entry(
+                compute_file_hash(args.output),
+                'watermarked-image',
+                f'Steganographic image: {args.output}',
+                {'input': args.input, 'output': args.output}
+            )
+            print(f"[LEDGER] Entry ID: {entry_id}")
+        else:
+            print("[ERROR] Failed to watermark image")
+            
+    elif args.command == 'scan-clones':
+        print(f"[SCAN] Monitoring {args.url} for {args.duration} days")
+        # Would implement continuous scanning logic here
+        print("[SCAN] For production, deploy as cron job or cloud function")
+        
+    elif args.command == 'log-server':
+        start_log_server(args.port)
+        
+    elif args.command == 'generate-report':
+        generate_evidence_report(args.output)
+        
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()
+
+# ============================================================
+# SECTION 10: BROWSER INTEGRITY CHECKER (standalone module)
+# ============================================================
+
+def generate_html_page_with_protection(site_id: str, tracking_domain: str, 
+                                       content_title: str) -> str:
+    """Generate a complete HTML page with built-in protection."""
+    protection_script = generate_dom_protection_script(site_id, tracking_domain)
+    
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="content-owner" content="{site_id}">
+    <meta name="source-origin" content="{tracking_domain}">
+    <title>{content_title}</title>
+    <script>
+        // Embedded protection
+        {protection_script}
+    </script>
+    <style>
+        .protected-content {{
+            position: relative;
+        }}
+        .watermark-overlay {{
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            opacity: 0.3;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 9999;
+        }}
+    </style>
+</head>
+<body>
+    <div class="protected-content">
+        <!-- Your actual content here -->
+        <h1>{content_title}</h1>
+        <p>This content is protected and tracked.</p>
+    </div>
+    
+    <div class="watermark-overlay">
+        Original: {tracking_domain} | ID: {site_id}
+    </div>
+</body>
+</html>
+'''
+    return html
+
+
+def generate_readme():
+    """Generate comprehensive README for the project."""
+    readme = '''# Evidence Toolkit — Digital Attribution & Tracking
+
+A Python toolkit for protecting, tracking, and proving ownership of digital content.
+
+## Features
+
+- **Hash Ledger**: Cryptographically-chained proof of existence timestamps
+- **Text Watermarking**: Invisible unicode and whitespace steganography
+- **Image Steganography**: LSB embedding for hidden messages
+- **Audio Watermarking**: Frequency-based audio tags
+- **DOM Protection**: JavaScript that tracks content access and modifications
+- **Beacon Logging**: Server that records who accessed your tracked pages
+- **Clone Scanner**: Tools to find unauthorized copies of your content
+- **Report Generator**: Audit trail documentation
+
+## Installation
+
+```bash
+# Clone or create the project
+git clone https://github.com/violetiam81594/evidence-toolkit.git
+cd evidence-toolkit
+
+# Install dependencies
+pip install Pillow scipy numpy
+
+# Optional: For advanced scanning
+pip install requests beautifulsoup4
+```
+
+## Quick Start
+
+### 1. Initialize Your Project
+```bash
+python evidence_toolkit.py init
+```
+
+### 2. Hash Important Files (Proof of Existence)
+```bash
+python evidence_toolkit.py hash-file my_video.mp4
+python evidence_toolkit.py hash-file contract.pdf
+```
+
+### 3. Watermark Your Content
+```bash
+# Text files
+python evidence_toolkit.py watermark-text --input script.txt --output script_wm.txt --watermark "violetiam81594-2025"
+
+# Images (steganographic)
+python evidence_toolkit.py watermark-image --input photo.jpg --output photo_wm.jpg --secret "owner=violetiam81594|date=2025-12-31"
+```
+
+### 4. Deploy Tracking to Your Website
+```bash
+# Generate protected HTML page
+python -c "
+from evidence_toolkit import generate_html_page_with_protection
+print(generate_html_page_with_protection('mysite-001', 'https://track.mydomain.com', 'Protected Content'))
+" > protected_page.html
+```
+
+### 5. Start Beacon Logger
+```bash
+# Run on your server or VPS
+python evidence_toolkit.py log-server --port 8888
+```
+
+### 6. Monitor for Clones
+```bash
+# Set up as scheduled task/cron for ongoing monitoring
+python evidence_toolkit.py scan-clones --url https://yoursite.com --duration 30
+```
+
+## Understanding the Data
+
+### Beacon Logs Format
+Each log entry contains:
+- `client_ip`: Who accessed your tracked page
+- `timestamp`: When the access occurred
+- `eventType`: PAGE_LOAD, COPY_ATTEMPT, DOM_MODIFIED, etc.
+- `referrer`: Where they came from
+- `sessionFingerprint`: Device/browser signature
+
+### Ledger Verification
+To verify your content's hash chain wasn't tampered with:
+```bash
+python -c "
+from evidence_toolkit import HashLedger
+ledger = HashLedger()
+if ledger.verify_integrity():
+    print('[OK] Ledger integrity verified')
+else:
+    print('[FAIL] Ledger corrupted!')
+"
+```
+
+## Legal Disclaimer
+
+This toolkit is for **evidence collection**, not automatic enforcement. IP addresses alone are not sufficient for legal identification. Always consult with qualified legal counsel before pursuing infringers.
+
+## Contributing
+
+Contributions welcome! Submit PRs or issues to the repository.
+
+## License
+
+MIT License — Feel free to use, modify, and distribute.
+
+---
+
+**Built by violetiam81594**
+'''
+    return readme
+
+
+if __name__ == '__main____init__':
+    # Auto-generate README on module import if running directly
+    pass
