@@ -1,0 +1,220 @@
+# BLAME GAME
+
+**Code forensics and accountability tooling.** Scans source for deceptive patterns, logs every file change immutably, and attributes device access to IP, location, and fingerprint.
+
+> *"Those with nothing to fear have nothing to hide."*
+
+---
+
+## What This Is
+
+Blame Game is a defensive auditing toolkit. It does three things:
+
+1. **Static pattern analysis** — scans local or remote code for known deceptive constructs: disguised payment routing, fake privacy controls, obfuscated endpoints, undisclosed data exfiltration, consent bypasses.
+2. **Immutable change logging** — every file modification is written to an append-only SQLite store with timestamp, actor, reason, and approver. There is no delete path.
+3. **Device attestation** — records IP, approximate geolocation, user-agent, and a derived device fingerprint for each access to tracked content, along with consent state.
+
+Everything is logged. Nothing is silently discarded.
+
+---
+
+## What This Is Not
+
+Being straight about scope, because overclaiming here causes real harm:
+
+- **It is not proof of wrongdoing.** It produces *findings*, not verdicts. A pattern match is a signal to investigate, not a conclusion.
+- **An IP address is not a person.** Carrier-grade NAT, VPNs, Tor exit nodes, corporate proxies, and shared Wi-Fi all mean an IP identifies a *connection*, not an individual. Courts generally treat IP logs as corroborating evidence, not identification.
+- **Pattern matching produces false positives.** Legitimate code contains `sendBeacon`, `setTimeout`, and base64 decoding. Context decides meaning.
+- **Client-side telemetry is forgeable.** Anything running in a browser the subject controls can be stripped, spoofed, or blocked.
+- **Geolocation from IP is approximate.** Typically city-level at best, sometimes wrong by hundreds of kilometres, and useless behind commercial VPNs.
+
+Use this as an evidence-gathering aid. Pair it with legal advice before acting on anything.
+
+---
+
+## Install
+
+```bash
+git clone https://github.com/violetiam81594/blame-game.git
+cd blame-game
+pip install requests
+```
+
+Python 3.9+ required. No other mandatory dependencies — the analyzer, logger, and reporter all use the standard library.
+
+---
+
+## Quick Start
+
+```bash
+# Scan a local project
+python blame_game.py scan ./my-project --output findings.json
+
+# Scan a remote page
+python blame_game.py scan-remote https://example.com --output remote_findings.json
+
+# Inspect the pattern database
+python blame_game.py list-patterns
+python blame_game.py list-patterns --category financial
+
+# Record a device access
+python blame_game.py attest-device \
+    --ip 203.0.113.42 \
+    --ua "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+    --consent
+
+# Record a file change (append-only)
+python blame_game.py log-change \
+    --file app.js \
+    --type modified \
+    --changed-by "j.doe@example.com" \
+    --reason "fixed null deref in checkout" \
+    --approved-by "review-lead"
+
+# Verify the audit database has no integrity violations
+python blame_game.py verify
+
+# Generate the report
+python blame_game.py report --output blame_game_report.md
+```
+
+---
+
+## Command Reference
+
+| Command | Arguments | Purpose |
+|---|---|---|
+| `scan` | `path`, `--output` | Recursively analyse a file or directory |
+| `scan-remote` | `url`, `--output` | Fetch and analyse a remote page |
+| `attest-device` | `--ip`, `--ua`, `--consent` | Record a device access event |
+| `log-change` | `--file`, `--type`, `--changed-by`, `--reason`, `--approved-by` | Append a change record |
+| `report` | `--output` | Build the markdown accountability report |
+| `list-patterns` | `--category` | Print the detection database |
+| `verify` | — | Check audit DB integrity |
+
+Valid `--type` values: `created`, `modified`, `deleted`.
+Valid `--category` values: `financial`, `deception`, `data_theft`, `obfuscation`, `malware`.
+
+---
+
+## Detection Categories
+
+Findings are scored 0–100 and bucketed into four threat levels.
+
+| Level | Score | Meaning | Recommended Action |
+|---|---|---|---|
+| `low` | 25 | Suspicious, plausibly benign | Review and document rationale |
+| `medium` | 50 | Warrants investigation | Request explanation from author |
+| `high` | 75 | Likely deceptive | Block deployment, security review |
+| `critical` | 100 | Confirmed harmful construct | Remove, preserve evidence |
+
+### Pattern Database (v1.0)
+
+| Pattern | Category | Level | Targets |
+|---|---|---|---|
+| `stripe_hidden_redirect` | financial | high | Intermediary payment routing (`r.stripe`, `payment.bounce`) |
+| `p2p_obfuscated_transfer` | financial | medium | Untraceable-transfer vocabulary |
+| `kanata_kantana_api_labs` | deception | high | Implausible third-party API vendors |
+| `ad_privacy_deception` | data_theft | high | "Privacy" branding beside collection logic |
+| `null_fallback_exploit` | obfuscation | critical | Null-coalesce redirects into parent frames |
+| `index_manipulation` | obfuscation | high | Index arithmetic feeding `eval`/`require` |
+| `ai_blame_shift` | deception | medium | Comments attributing human decisions to a model |
+| `hidden_webhook` | data_theft | high | Undisclosed external callbacks |
+| `consent_bypass` | data_theft | critical | Logic that overrides opt-out |
+| `obfuscated_endpoint` | obfuscation | high | Base64/`atob`-hidden hosts |
+| `data_exfiltration_beacon` | data_theft | high | Silent `sendBeacon`/`fetch` telemetry |
+| `dom_overwrite_attack` | obfuscation | medium | Whole-body `innerHTML` replacement |
+| `timer_based_evasion` | obfuscation | medium | Delayed execution to defeat static analysis |
+| `crypto_miner_hidden` | malware | critical | Covert mining pool startup |
+| `keylogger_pattern` | malware | critical | Global keystroke capture |
+
+Adding patterns is straightforward — append a `RedFlagPattern` entry to `RED_FLAG_DATABASE` in `blame_game.py`.
+
+---
+
+## Data Model
+
+Three SQLite stores, all append-oriented.
+
+**`traffic_audit.db` → `network_requests`**
+`id`, `timestamp`, `source_ip`, `destination_url`, `method`, `headers_json`, `body_size`, `response_status`, `user_agent`, `referrer`, `origin_page`, `is_third_party`, `data_sent_categories`, `data_received_categories`
+
+**`change_audit.db` → `file_changes`**
+`id`, `timestamp`, `file_path`, `change_type`, `changed_by`, `old_hash`, `new_hash`, `diff_summary`, `reason_provided`, `approved_by`
+
+Both are indexed on timestamp and on the primary lookup column. Query directly with any SQLite client.
+
+---
+
+## Report Output
+
+`python blame_game.py report` emits markdown containing:
+
+- Summary counts by severity and category
+- The twenty highest-scoring findings with file, line, matched code, and action
+- Recent device attestations with location and consent state
+- Recent change-log entries with reasons and approvals
+- The full pattern reference
+- A verification hash for the report itself
+
+---
+
+## Known Issues — Read Before Running
+
+Version 1.0 as committed **will not execute cleanly**. These need fixing first:
+
+1. **`ThreatLevel.MEDIUM` is syntactically invalid.** The line reads `MEDIUM = "medium"     | Requires investigation` — the trailing prose breaks the enum definition. This is a hard parse error; the module won't import.
+
+2. **Empty alternation in `null_fallback_exploit`.** The regex begins `(?:||\s*null|...)`. The leading `||` is an empty alternative, which matches the empty string — meaning *every line of every file* matches. Left unfixed, your scan output is pure noise. Change to `(?:\|\||\s*null|...)`.
+
+3. **Mismatched bracket** in the `watermark-text` branch: `print(f"[LEDGER] Entry ID: {entry_id]")` — should close with `}`.
+
+4. **Typo in the module guard** at the bottom: `if __name__ == '__main____init__':` — four underscores. Should be `'__main__'`.
+
+5. **`NetworkTrafficLogger.__init__` is incompatible with `BaseHTTPRequestHandler`.** The handler is instantiated by the server as `(request, client_address, server)`, so the custom `log_database` keyword never arrives. Move DB initialisation to a class attribute or module-level constant.
+
+6. **Unused imports** — `struct`, `socket`, `threading`, `base64`, `http.client`, `traceback`. Harmless, but lint noise.
+
+Items 1–4 are blockers. Item 5 breaks the traffic logger specifically. Happy to ship a corrected v1.1 on request.
+
+---
+
+## Legal and Ethical Notes
+
+Read this section before deploying anything that logs other people's traffic.
+
+- **Jurisdiction matters.** Traffic interception, device fingerprinting, and geolocation logging are regulated differently across countries. In the EU/UK, IP addresses are generally treated as personal data under GDPR; logging them without a lawful basis carries exposure. Several US states have comparable statutes.
+- **Consent has teeth.** If your jurisdiction requires notice or consent for fingerprinting, a tool that logs access without it may itself be unlawful — regardless of what the other party did.
+- **Interception of networks you don't own or administer is a serious offence in most jurisdictions.** Scan your own systems, or systems you have written authorisation to test.
+- **Preserve, don't publish.** If you believe you have evidence of wrongdoing, the correct sequence is: secure the evidence, consult a lawyer, then act. Publishing IP logs and location data can expose you to defamation and privacy claims, and can contaminate evidence.
+- **False accusations cause real damage.** A pattern match plus an IP address is a hypothesis. Treat it as one.
+
+The project's stated premise is that transparency favours honest actors. That's a defensible position, but it isn't a legal shield, and it doesn't hold uniformly — people have legitimate reasons for privacy that have nothing to do with guilt.
+
+---
+
+## Roadmap
+
+- [ ] Fix the six known issues above
+- [ ] AST-based analysis instead of line-by-line regex (cuts false positives sharply)
+- [ ] Entropy scoring for obfuscation detection
+- [ ] GitHub Action for CI-integrated scanning
+- [ ] Signed, hash-chained change log (currently append-only but not cryptographically sealed)
+- [ ] OpenTimestamps submission for report anchoring
+- [ ] Configurable pattern packs loaded from YAML
+
+---
+
+## Contributing
+
+Issues and pull requests welcome. For new detection patterns, include a minimal reproduction case and note the expected false-positive rate.
+
+---
+
+## License
+
+MIT.
+
+---
+
+*Built by [violetiam81594](https://github.com/violetiam81594)*
